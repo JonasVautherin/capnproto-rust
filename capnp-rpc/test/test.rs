@@ -32,6 +32,8 @@ use futures::{Future, FutureExt, TryFutureExt};
 capnp::generated_code!(pub mod test_capnp);
 
 pub mod disconnector_test;
+#[cfg(unix)]
+pub mod fd_test;
 pub mod impls;
 pub mod reconnect_test;
 pub mod test_util;
@@ -82,7 +84,7 @@ fn disconnector_setup() -> (
     (client_rpc_system, server_rpc_system)
 }
 
-fn spawn<F>(spawner: &mut futures::executor::LocalSpawner, task: F)
+pub(crate) fn spawn<F>(spawner: &mut futures::executor::LocalSpawner, task: F)
 where
     F: Future<Output = Result<(), Error>> + 'static,
 {

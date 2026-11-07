@@ -34,11 +34,18 @@ pub type VatId = crate::rpc_twoparty_capnp::Side;
 
 struct IncomingMessage {
     message: ::capnp::message::Reader<capnp::serialize::OwnedSegments>,
+    /// The descriptors that came with it, by `CapDescriptor.attachedFd`, each taken once.
+    #[cfg(unix)]
+    fds: RefCell<Vec<Option<std::os::fd::OwnedFd>>>,
 }
 
 impl IncomingMessage {
     pub(crate) fn new(message: ::capnp::message::Reader<capnp::serialize::OwnedSegments>) -> Self {
-        Self { message }
+        Self {
+            message,
+            #[cfg(unix)]
+            fds: RefCell::new(Vec::new()),
+        }
     }
 }
 
@@ -46,14 +53,47 @@ impl crate::IncomingMessage for IncomingMessage {
     fn get_body(&self) -> ::capnp::Result<::capnp::any_pointer::Reader<'_>> {
         self.message.get_root()
     }
+
+    #[cfg(unix)]
+    fn take_fd(&self, index: usize) -> Option<std::os::fd::OwnedFd> {
+        self.fds.borrow_mut().get_mut(index)?.take()
+    }
+}
+
+/// A message on its way out, with the descriptors of its capabilities when the connection passes
+/// them (`VatNetwork::new_with_fds()`; any other connection writes the message alone).
+struct Outbound {
+    message: Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>,
+    #[cfg(unix)]
+    fds: Vec<Rc<dyn std::os::fd::AsFd>>,
+}
+
+impl ::capnp_futures::serialize::AsOutputSegments for Outbound {
+    fn as_output_segments(&self) -> ::capnp::OutputSegments<'_> {
+        self.message.get_segments_for_output()
+    }
+}
+
+#[cfg(unix)]
+impl ::capnp_futures::fd::AttachedFds for Outbound {
+    fn attached_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        self.fds.iter().map(|fd| fd.as_fd()).collect()
+    }
 }
 
 struct OutgoingMessage {
     message: ::capnp::message::Builder<::capnp::message::HeapAllocator>,
-    sender: ::capnp_futures::Sender<Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>>,
+    #[cfg(unix)]
+    fds: Vec<Rc<dyn std::os::fd::AsFd>>,
+    sender: ::capnp_futures::Sender<Outbound>,
 }
 
 impl crate::OutgoingMessage for OutgoingMessage {
+    #[cfg(unix)]
+    fn set_fds(&mut self, fds: Vec<Rc<dyn std::os::fd::AsFd>>) {
+        self.fds = fds;
+    }
+
     fn get_body(&mut self) -> ::capnp::Result<::capnp::any_pointer::Builder<'_>> {
         self.message.get_root()
     }
@@ -71,11 +111,18 @@ impl crate::OutgoingMessage for OutgoingMessage {
         let tmp = *self;
         let Self {
             message,
+            #[cfg(unix)]
+            fds,
             mut sender,
         } = tmp;
         let m = Rc::new(message);
+        let outbound = Outbound {
+            message: m.clone(),
+            #[cfg(unix)]
+            fds,
+        };
         (
-            Promise::from_future(sender.send(m.clone()).map_ok(|_| ())),
+            Promise::from_future(sender.send(outbound).map_ok(|_| ())),
             m,
         )
     }
@@ -94,12 +141,19 @@ where
     T: AsyncRead + 'static,
 {
     input_stream: Rc<RefCell<Option<T>>>,
-    sender: ::capnp_futures::Sender<Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>>,
+    sender: ::capnp_futures::Sender<Outbound>,
     side: crate::rpc_twoparty_capnp::Side,
     receive_options: ReaderOptions,
     on_disconnect_fulfiller: Option<oneshot::Sender<()>>,
     window_size_in_bytes: usize,
+    /// How to take the descriptors that came with a message just read, and at most how many to
+    /// keep (`VatNetwork::new_with_fds()`); none: the connection doesn't pass them.
+    #[cfg(unix)]
+    fds: Option<(TakeFds<T>, usize)>,
 }
+
+#[cfg(unix)]
+type TakeFds<T> = fn(&mut T) -> Vec<std::os::fd::OwnedFd>;
 
 struct Connection<T>
 where
@@ -128,9 +182,7 @@ where
 {
     fn new(
         input_stream: T,
-        sender: ::capnp_futures::Sender<
-            Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>,
-        >,
+        sender: ::capnp_futures::Sender<Outbound>,
         side: crate::rpc_twoparty_capnp::Side,
         receive_options: ReaderOptions,
         on_disconnect_fulfiller: oneshot::Sender<()>,
@@ -143,6 +195,8 @@ where
                 receive_options,
                 on_disconnect_fulfiller: Some(on_disconnect_fulfiller),
                 window_size_in_bytes: crate::flow_control::DEFAULT_WINDOW_SIZE,
+                #[cfg(unix)]
+                fds: None,
             })),
         }
     }
@@ -165,6 +219,8 @@ where
         );
         Box::new(OutgoingMessage {
             message,
+            #[cfg(unix)]
+            fds: Vec::new(),
             sender: self.inner.borrow().sender.clone(),
         })
     }
@@ -179,13 +235,31 @@ where
         match maybe_input_stream {
             Some(mut s) => {
                 let receive_options = inner.receive_options;
+                #[cfg(unix)]
+                let fds = inner.fds;
                 Promise::from_future(async move {
                     let maybe_message =
                         ::capnp_futures::serialize::try_read_message(&mut s, receive_options)
                             .await?;
+                    // The reader never reads past the message, so what came while reading it is
+                    // its own (capnp_futures::fd).
+                    #[cfg(unix)]
+                    let received = match fds {
+                        Some((take, max)) => {
+                            let mut received = take(&mut s);
+                            received.truncate(max);
+                            received
+                        }
+                        None => Vec::new(),
+                    };
                     *return_it_here.borrow_mut() = Some(s);
                     Ok(maybe_message.map(|message| {
-                        Box::new(IncomingMessage::new(message)) as Box<dyn crate::IncomingMessage>
+                        let incoming = IncomingMessage::new(message);
+                        #[cfg(unix)]
+                        {
+                            *incoming.fds.borrow_mut() = received.into_iter().map(Some).collect();
+                        }
+                        Box::new(incoming) as Box<dyn crate::IncomingMessage>
                     }))
                 })
             }
@@ -249,13 +323,23 @@ where
     where
         U: AsyncWrite + 'static + Unpin,
     {
+        let (sender, write_queue) = ::capnp_futures::write_queue(output_stream);
+        Self::from_parts(input_stream, sender, write_queue, side, receive_options)
+    }
+
+    /// The network over `input_stream`, whose messages `sender` queues for `write_queue`.
+    fn from_parts(
+        input_stream: T,
+        tx: ::capnp_futures::Sender<Outbound>,
+        write_queue: impl futures::Future<Output = Result<(), ::capnp::Error>> + 'static,
+        side: crate::rpc_twoparty_capnp::Side,
+        receive_options: ReaderOptions,
+    ) -> Self {
         let (fulfiller, disconnect_promise) = oneshot::channel();
         let disconnect_promise =
             disconnect_promise.map_err(|_| ::capnp::Error::disconnected("disconnected".into()));
 
         let (execution_driver, sender) = {
-            let (tx, write_queue) = ::capnp_futures::write_queue(output_stream);
-
             // Don't use `.join()` here because we need to make sure to wait for `disconnect_promise` to
             // resolve even if `write_queue` resolves to an error.
             (
@@ -285,6 +369,47 @@ where
         if let Some(ref mut conn) = self.connection {
             conn.inner.borrow_mut().window_size_in_bytes = window_size;
         }
+    }
+}
+
+#[cfg(unix)]
+impl<R> VatNetwork<::capnp_futures::fd::ReadFds<R>>
+where
+    R: ::capnp_futures::fd::AsyncFdRead + Unpin + 'static,
+{
+    /// As [`new()`](Self::new), over a stream that passes file descriptors (a Unix socket): a
+    /// capability with a descriptor attached (`crate::new_client_with_fd()`) sends it along, and
+    /// one received comes with its own (`crate::get_fd()`), as the C++ implementation's
+    /// `TwoPartyVatNetwork` with `maxFdsPerMessage` does, and interoperating with it.
+    ///
+    /// At most `max_fds_per_message` descriptors are kept from each message, those beyond closed;
+    /// zero receives none (and still sends). The streams must not be buffered: a buffered
+    /// reader would read ahead into the next message and take its descriptors.
+    pub fn new_with_fds<W>(
+        input_stream: R,
+        output_stream: W,
+        max_fds_per_message: usize,
+        side: crate::rpc_twoparty_capnp::Side,
+        receive_options: ReaderOptions,
+    ) -> Self
+    where
+        W: ::capnp_futures::fd::AsyncFdWrite + Unpin + 'static,
+    {
+        let (sender, write_queue) = ::capnp_futures::fd::write_queue(output_stream);
+        let network = Self::from_parts(
+            ::capnp_futures::fd::ReadFds::new(input_stream),
+            sender,
+            write_queue,
+            side,
+            receive_options,
+        );
+        if let Some(c) = &network.connection {
+            c.inner.borrow_mut().fds = Some((
+                ::capnp_futures::fd::ReadFds::take_fds as TakeFds<_>,
+                max_fds_per_message,
+            ));
+        }
+        network
     }
 }
 

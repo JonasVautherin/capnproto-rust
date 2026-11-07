@@ -53,6 +53,43 @@ pub(crate) type AnswerId = QuestionId;
 pub(crate) type ExportId = u32;
 pub(crate) type ImportId = ExportId;
 
+/// The file descriptors of an outgoing message's capabilities, in the order of their
+/// `CapDescriptor.attachedFd` indices.
+#[derive(Default)]
+struct MessageFds {
+    #[cfg(unix)]
+    fds: Vec<Rc<dyn std::os::fd::AsFd>>,
+}
+
+impl MessageFds {
+    fn attach_to(self, _message: &mut dyn crate::OutgoingMessage) {
+        #[cfg(unix)]
+        _message.set_fds(self.fds);
+    }
+
+    /// Attaches `cap`'s descriptor, if it has one, to the descriptor just written for it. As the
+    /// C++ implementation does: whatever kind of descriptor it is, the capability's resolutions
+    /// followed first (a promise resolved to a capability with a descriptor carries it).
+    fn write(&mut self, _cap: &dyn ClientHook, _descriptor: &mut cap_descriptor::Builder<'_>) {
+        #[cfg(unix)]
+        {
+            // `attachedFd` is a UInt8 whose 255 means none, and Linux passes at most 253
+            // descriptors with a message (SCM_MAX_FD): past those, the capability goes alone.
+            if self.fds.len() >= 253 {
+                return;
+            }
+            let mut cap = _cap.add_ref();
+            while let Some(resolved) = cap.get_resolved() {
+                cap = resolved;
+            }
+            if let Some(fd) = cap.get_fd() {
+                _descriptor.set_attached_fd(self.fds.len() as u8);
+                self.fds.push(fd);
+            }
+        }
+    }
+}
+
 pub(crate) struct ImportTable<T> {
     slots: HashMap<u32, T>,
 }
@@ -766,6 +803,7 @@ impl<VatId> ConnectionState<VatId> {
 
         let mut response = connection_state.new_outgoing_message(10)?;
 
+        let mut fds = MessageFds::default();
         let result_exports = {
             let mut ret = response
                 .get_body()?
@@ -783,8 +821,9 @@ impl<VatId> ConnectionState<VatId> {
             }
             assert_eq!(cap_table.len(), 1);
 
-            Self::write_descriptors(connection_state, &cap_table, payload)?
+            Self::write_descriptors(connection_state, &cap_table, payload, &mut fds)?
         };
+        fds.attach_to(response.as_mut());
 
         let slots = &mut connection_state.answers.borrow_mut().slots;
         let hash_map::Entry::Vacant(slot) = slots.entry(answer_id) else {
@@ -837,9 +876,13 @@ impl<VatId> ConnectionState<VatId> {
         Ok(())
     }
 
-    fn handle_resolve(connection_state: &Rc<Self>, resolve: resolve::Reader) -> capnp::Result<()> {
+    fn handle_resolve(
+        connection_state: &Rc<Self>,
+        resolve: resolve::Reader,
+        message: &dyn crate::IncomingMessage,
+    ) -> capnp::Result<()> {
         let replacement_or_error = match resolve.which()? {
-            resolve::Cap(c) => match Self::receive_cap(connection_state, c?)? {
+            resolve::Cap(c) => match Self::receive_cap(connection_state, c?, message)? {
                 Some(cap) => Ok(cap),
                 None => {
                     return Err(Error::failed(
@@ -984,7 +1027,11 @@ impl<VatId> ConnectionState<VatId> {
                         call.get_interface_id(),
                         call.get_method_id(),
                         call.get_question_id(),
-                        Self::receive_caps(&connection_state, payload.get_cap_table()?)?,
+                        Self::receive_caps(
+                            &connection_state,
+                            payload.get_cap_table()?,
+                            message.as_ref(),
+                        )?,
                         redirect_results,
                     )
                 };
@@ -1092,6 +1139,7 @@ impl<VatId> ConnectionState<VatId> {
                                     let cap_table = Self::receive_caps(
                                         &connection_state,
                                         results?.get_cap_table()?,
+                                        message.as_ref(),
                                     )?;
 
                                     let question_ref =
@@ -1163,7 +1211,9 @@ impl<VatId> ConnectionState<VatId> {
                 }
             }
             Ok(message::Finish(finish)) => Self::handle_finish(&connection_state, finish?)?,
-            Ok(message::Resolve(resolve)) => Self::handle_resolve(&connection_state, resolve?)?,
+            Ok(message::Resolve(resolve)) => {
+                Self::handle_resolve(&connection_state, resolve?, message.as_ref())?
+            }
             Ok(message::Release(release)) => {
                 let release = release?;
                 connection_state.release_export(release.get_id(), release.get_reference_count())?;
@@ -1402,16 +1452,20 @@ impl<VatId> ConnectionState<VatId> {
 
                     // OK, we have to send a `Resolve` message.
                     let mut message = connection_state.new_outgoing_message(15)?;
+                    let mut fds = MessageFds::default();
                     {
                         let root: message::Builder = message.get_body()?.get_as()?;
                         let mut resolve = root.init_resolve();
                         resolve.set_promise_id(export_id);
+                        let mut descriptor = resolve.init_cap();
                         let _export = Self::write_descriptor(
                             &connection_state,
-                            resolution,
-                            resolve.init_cap(),
+                            resolution.clone(),
+                            descriptor.reborrow(),
                         )?;
+                        fds.write(resolution.as_ref(), &mut descriptor);
                     }
+                    fds.attach_to(message.as_mut());
                     let _ = message.send();
                     Ok(())
                 }
@@ -1499,19 +1553,20 @@ impl<VatId> ConnectionState<VatId> {
         state: &Rc<Self>,
         cap_table: &[Option<Box<dyn ClientHook>>],
         payload: payload::Builder,
+        fds: &mut MessageFds,
     ) -> capnp::Result<Vec<ExportId>> {
         let mut cap_table_builder = payload.init_cap_table(cap_table.len() as u32);
         let mut exports = Vec::new();
         for (idx, value) in cap_table.iter().enumerate() {
             match value {
                 Some(cap) => {
-                    if let Some(export_id) = Self::write_descriptor(
-                        state,
-                        cap.clone(),
-                        cap_table_builder.reborrow().get(idx as u32),
-                    )? {
+                    let mut descriptor = cap_table_builder.reborrow().get(idx as u32);
+                    if let Some(export_id) =
+                        Self::write_descriptor(state, cap.clone(), descriptor.reborrow())?
+                    {
                         exports.push(export_id);
                     }
+                    fds.write(cap.as_ref(), &mut descriptor);
                 }
                 None => {
                     cap_table_builder.reborrow().get(idx as u32).set_none(());
@@ -1601,17 +1656,47 @@ impl<VatId> ConnectionState<VatId> {
         }
     }
 
+    /// Gives the import `import_id` the descriptor that came with it, unless it has one already:
+    /// the first wins, as in the C++ implementation (an import's descriptor never changes).
+    #[cfg(unix)]
+    fn set_import_fd(state: &Rc<Self>, import_id: ImportId, fd: Option<std::os::fd::OwnedFd>) {
+        let Some(fd) = fd else { return };
+        let imports = state.imports.borrow();
+        let Some(import) = imports
+            .slots
+            .get(&import_id)
+            .and_then(|i| i.import_client.upgrade())
+        else {
+            return;
+        };
+        let mut import = import.borrow_mut();
+        if import.fd.is_none() {
+            import.fd = Some(Rc::new(fd));
+        }
+    }
+
     fn receive_cap(
         state: &Rc<Self>,
         descriptor: cap_descriptor::Reader,
+        _message: &dyn crate::IncomingMessage,
     ) -> ::capnp::Result<Option<Box<dyn ClientHook>>> {
+        // The descriptor that came with it, if any, as the C++ implementation takes it: for an
+        // import (hosted or a promise) it is kept; for anything else it is closed.
+        #[cfg(unix)]
+        let fd = _message.take_fd(descriptor.get_attached_fd() as usize);
         match descriptor.which()? {
             cap_descriptor::None(()) => Ok(None),
             cap_descriptor::SenderHosted(sender_hosted) => {
-                Ok(Some(Self::import(state, sender_hosted, false)))
+                let cap = Self::import(state, sender_hosted, false);
+                #[cfg(unix)]
+                Self::set_import_fd(state, sender_hosted, fd);
+                Ok(Some(cap))
             }
             cap_descriptor::SenderPromise(sender_promise) => {
-                Ok(Some(Self::import(state, sender_promise, true)))
+                let cap = Self::import(state, sender_promise, true);
+                #[cfg(unix)]
+                Self::set_import_fd(state, sender_promise, fd);
+                Ok(Some(cap))
             }
             cap_descriptor::ReceiverHosted(receiver_hosted) => {
                 if let Some(exp) = state.exports.borrow_mut().find(receiver_hosted) {
@@ -1644,10 +1729,11 @@ impl<VatId> ConnectionState<VatId> {
     fn receive_caps(
         state: &Rc<Self>,
         cap_table: ::capnp::struct_list::Reader<cap_descriptor::Owned>,
+        message: &dyn crate::IncomingMessage,
     ) -> ::capnp::Result<Vec<Option<Box<dyn ClientHook>>>> {
         let mut result = Vec::new();
         for idx in 0..cap_table.len() {
-            result.push(Self::receive_cap(state, cap_table.get(idx))?);
+            result.push(Self::receive_cap(state, cap_table.get(idx), message)?);
         }
         Ok(result)
     }
@@ -1851,11 +1937,14 @@ where
         Promise<Response<VatId>, Error>,
     )> {
         // Build the cap table.
+        let mut fds = MessageFds::default();
         let exports = ConnectionState::write_descriptors(
             connection_state,
             cap_table,
             get_call(&mut message).unwrap().get_params().unwrap(),
+            &mut fds,
         )?;
+        fds.attach_to(message.as_mut());
 
         // Init the question table.  Do this after writing descriptors to avoid interference.
         let mut question = Question::<VatId>::new();
@@ -1902,11 +1991,14 @@ where
         flow: Rc<RefCell<Option<Box<dyn crate::FlowController>>>>,
     ) -> Promise<(), Error> {
         // Build the cap table.
+        let mut fds = MessageFds::default();
         let exports = pry!(ConnectionState::write_descriptors(
             connection_state,
             cap_table,
             get_call(&mut message).unwrap().get_params().unwrap(),
+            &mut fds,
         ));
+        fds.attach_to(message.as_mut());
 
         // Init the question table.  Do this after writing descriptors to avoid interference.
         let mut question = Question::<VatId>::new();
@@ -2609,6 +2701,7 @@ impl ResultsDone {
                                 Ok(hook)
                             }
                             (false, Ok(())) => {
+                                let mut fds = MessageFds::default();
                                 let exports = {
                                     let root: message::Builder = message.get_body()?.get_as()?;
                                     let message::Return(Ok(mut ret)) = root.which()? else {
@@ -2627,8 +2720,10 @@ impl ResultsDone {
                                         &connection_state,
                                         &cap_table,
                                         payload,
+                                        &mut fds,
                                     )?
                                 };
+                                fds.attach_to(message.as_mut());
 
                                 let (_promise, m) = message.send();
                                 connection_state.answer_has_sent_return(answer_id, exports);
@@ -2790,6 +2885,8 @@ where
 
     /// Number of times we've received this import from the peer.
     remote_ref_count: u32,
+    #[cfg(unix)]
+    fd: Option<Rc<dyn std::os::fd::AsFd>>,
 }
 
 impl<VatId> Drop for ImportClient<VatId> {
@@ -2839,6 +2936,8 @@ where
             connection_state: connection_state.clone(),
             import_id,
             remote_ref_count: 0,
+            #[cfg(unix)]
+            fd: None,
         }))
     }
 
@@ -3180,6 +3279,15 @@ impl<VatId> Clone for Client<VatId> {
 }
 
 impl<VatId> ClientHook for Client<VatId> {
+    #[cfg(unix)]
+    fn get_fd(&self) -> Option<Rc<dyn std::os::fd::AsFd>> {
+        match &self.variant {
+            ClientVariant::Import(client) => client.borrow().fd.clone(),
+            ClientVariant::Pipeline(_) => None,
+            ClientVariant::Promise(client) => client.borrow().cap.get_fd(),
+        }
+    }
+
     fn add_ref(&self) -> Box<dyn ClientHook> {
         Box::new(self.clone())
     }
@@ -3396,6 +3504,84 @@ mod disconnect_tests {
     use super::*;
     use crate::rpc_twoparty_capnp::Side;
     use crate::VatNetwork;
+
+    #[cfg(unix)]
+    #[test]
+    fn received_fds_are_taken_once_and_first_import_fd_wins() {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        struct Incoming {
+            message: capnp::message::Builder<capnp::message::HeapAllocator>,
+            fd: RefCell<Option<OwnedFd>>,
+        }
+        impl crate::IncomingMessage for Incoming {
+            fn get_body(&self) -> capnp::Result<capnp::any_pointer::Reader<'_>> {
+                self.message.get_root_as_reader()
+            }
+            fn take_fd(&self, index: usize) -> Option<OwnedFd> {
+                if index == 0 {
+                    self.fd.borrow_mut().take()
+                } else {
+                    None
+                }
+            }
+        }
+
+        let (_tasks, state) = new_connection_state();
+        let (fd, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let incoming = Incoming {
+            message: capnp::message::Builder::new_default(),
+            fd: RefCell::new(Some(fd.into())),
+        };
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut caps = message.init_root::<payload::Builder>().init_cap_table(3);
+            for index in 0..3 {
+                let mut cap = caps.reborrow().get(index);
+                cap.set_sender_hosted(index + 23);
+                cap.set_attached_fd(if index == 2 { 255 } else { 0 });
+            }
+        }
+        let caps = ConnectionState::receive_caps(
+            &state,
+            message
+                .get_root_as_reader::<payload::Reader>()
+                .unwrap()
+                .get_cap_table()
+                .unwrap(),
+            &incoming,
+        )
+        .unwrap();
+        let original = caps[0].as_ref().unwrap().get_fd().unwrap();
+        assert!(caps[1].as_ref().unwrap().get_fd().is_none());
+        assert!(caps[2].as_ref().unwrap().get_fd().is_none());
+
+        let (fd, mut duplicate_peer) = UnixStream::pair().unwrap();
+        duplicate_peer.set_nonblocking(true).unwrap();
+        *incoming.fd.borrow_mut() = Some(fd.into());
+        let descriptor = message
+            .get_root_as_reader::<payload::Reader>()
+            .unwrap()
+            .get_cap_table()
+            .unwrap()
+            .get(0);
+        let repeated = ConnectionState::receive_cap(&state, descriptor, &incoming)
+            .unwrap()
+            .unwrap();
+        assert!(Rc::ptr_eq(&original, &repeated.get_fd().unwrap()));
+        assert_eq!(duplicate_peer.read(&mut [0]).unwrap(), 0);
+        drop(original);
+        drop(caps);
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(repeated);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
 
     fn new_connection_state() -> (TaskSet<Error>, Rc<ConnectionState<Side>>) {
         let mut network = crate::twoparty::VatNetwork::new(
@@ -3824,7 +4010,9 @@ mod disconnect_tests {
         let caps = [Some(cap.clone()), Some(cap), Some(imported)];
         let mut message = capnp::message::Builder::new_default();
         let payload = message.init_root::<payload::Builder>();
-        let exports = ConnectionState::write_descriptors(&state, &caps, payload).unwrap();
+        let exports =
+            ConnectionState::write_descriptors(&state, &caps, payload, &mut MessageFds::default())
+                .unwrap();
         assert_eq!(exports.len(), 2);
         assert_eq!(exports[0], exports[1]);
         assert_eq!(state.exports_by_cap.borrow()[&ptr], exports[0]);

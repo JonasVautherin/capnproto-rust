@@ -21,6 +21,8 @@
 pub use read_stream::ReadStream;
 pub use write_queue::{write_queue, Sender};
 
+#[cfg(unix)]
+pub mod fd;
 mod read_stream;
 pub mod serialize;
 pub mod serialize_packed;

@@ -219,3 +219,21 @@ interface TestSelf {
   foo @0 () -> (x :UInt32);
   getSelf @1 () -> (cap: TestSelf);
 }
+
+interface TestFd {
+  # File descriptors with capabilities (`twoparty::VatNetwork::new_with_fds()`).
+
+  echo @0 (cap :TestHandle) -> (cap :TestHandle, hadFd :Bool);
+  # Returns `cap`; `hadFd`: a descriptor came with it, and then a byte "x" was written to it.
+
+  make @1 () -> (cap :TestHandle);
+  # A capability with a descriptor of the server's: one end of a socket pair.
+
+  later @2 () -> (cap :TestHandle);
+  # A promise that resolves to `make`'s once `resolve` is called.
+
+  resolve @3 ();
+
+  check @4 () -> (byte :UInt8);
+  # The byte the client wrote to the descriptor of `make` or `later`.
+}

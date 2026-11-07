@@ -206,6 +206,16 @@ where
     fn when_resolved(&self) -> Promise<(), capnp::Error> {
         Promise::ok(())
     }
+
+    /// The current capability's, without connecting for it.
+    #[cfg(unix)]
+    fn get_fd(&self) -> Option<Rc<dyn std::os::fd::AsFd>> {
+        self.inner
+            .borrow()
+            .current
+            .as_ref()
+            .and_then(|hook| hook.get_fd())
+    }
 }
 
 struct Request<F, C> {

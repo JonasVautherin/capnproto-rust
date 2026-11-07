@@ -12,5 +12,8 @@ version = "0.3.0"
 default-features = false
 features = ["std", "executor"]
 
+[target.'cfg(unix)'.dependencies]
+capnp-futures = { path = "../capnp-futures" }
+
 [lints]
 workspace = true

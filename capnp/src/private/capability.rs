@@ -83,6 +83,18 @@ pub trait ClientHook {
 
     /// Repeatedly calls whenMoreResolved() until it returns nullptr.
     fn when_resolved(&self) -> Promise<(), crate::Error>;
+
+    /// The file descriptor attached to this capability, if any: one given when it was created
+    /// (`capnp_rpc::new_client_with_fd()`), or one that came with it over a connection that passes
+    /// file descriptors. An RPC connection that passes them sends it along with the capability.
+    ///
+    /// Shared by the capability's clones; it stays open while any of them, or any reference this
+    /// returns, is alive. If this returns `None` but `when_more_resolved()` returns a promise, the
+    /// descriptor may come with the resolution (`capnp_rpc::get_fd()` waits for it).
+    #[cfg(all(unix, feature = "std"))]
+    fn get_fd(&self) -> Option<alloc::rc::Rc<dyn std::os::fd::AsFd>> {
+        None
+    }
 }
 
 impl Clone for alloc::boxed::Box<dyn ClientHook> {

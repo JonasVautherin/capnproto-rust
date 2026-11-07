@@ -1,4 +1,5 @@
-// Simple in-memory byte stream.
+// Simple in-memory byte stream. On Unix it also passes file descriptors with its bytes
+// (capnp_futures::fd), as a Unix socket does.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,10 @@ struct Inner {
     read_end_closed: bool,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
+    /// Descriptors written and not yet read: (where their write starts and ends in `buffer`,
+    /// the descriptors), oldest first.
+    #[cfg(unix)]
+    fds: std::collections::VecDeque<(usize, usize, Vec<std::os::fd::OwnedFd>)>,
 }
 
 impl Inner {
@@ -27,6 +32,8 @@ impl Inner {
             read_end_closed: false,
             read_waker: None,
             write_waker: None,
+            #[cfg(unix)]
+            fds: std::collections::VecDeque::new(),
         }
     }
 }
@@ -68,11 +75,15 @@ pub fn channel() -> (Sender, Receiver) {
     (sender, receiver)
 }
 
-impl AsyncRead for Receiver {
-    fn poll_read(
-        self: Pin<&mut Self>,
+impl Receiver {
+    /// Reads into `buf`; descriptors that came with the bytes read go to `fds` (dropped, so closed,
+    /// if none). As Linux does on a Unix socket, the read that reaches the first byte of a write
+    /// with descriptors gets them, and stops at the end of that write.
+    fn read(
+        &self,
         cx: &mut futures::task::Context,
         buf: &mut [u8],
+        #[cfg(unix)] fds: Option<&mut Vec<std::os::fd::OwnedFd>>,
     ) -> futures::task::Poll<Result<usize, futures::io::Error>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.read_cursor == inner.write_cursor {
@@ -84,7 +95,21 @@ impl AsyncRead for Receiver {
             }
         } else {
             assert!(inner.read_cursor < inner.write_cursor);
-            let copy_len = std::cmp::min(buf.len(), inner.write_cursor - inner.read_cursor);
+            #[allow(unused_mut)]
+            let mut copy_len = std::cmp::min(buf.len(), inner.write_cursor - inner.read_cursor);
+            #[cfg(unix)]
+            {
+                let end = inner.read_cursor + copy_len;
+                if let Some(&(start, write_end, _)) = inner.fds.front() {
+                    if start < end {
+                        copy_len = write_end.min(end) - inner.read_cursor;
+                        let (_, _, received) = inner.fds.pop_front().unwrap();
+                        if let Some(fds) = fds {
+                            fds.extend(received);
+                        }
+                    }
+                }
+            }
             buf[0..copy_len]
                 .copy_from_slice(&inner.buffer[inner.read_cursor..inner.read_cursor + copy_len]);
             inner.read_cursor += copy_len;
@@ -96,11 +121,40 @@ impl AsyncRead for Receiver {
     }
 }
 
-impl AsyncWrite for Sender {
-    fn poll_write(
+impl AsyncRead for Receiver {
+    fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut futures::task::Context,
+        buf: &mut [u8],
+    ) -> futures::task::Poll<Result<usize, futures::io::Error>> {
+        self.read(
+            cx,
+            buf,
+            #[cfg(unix)]
+            None,
+        )
+    }
+}
+
+#[cfg(unix)]
+impl capnp_futures::fd::AsyncFdRead for Receiver {
+    fn poll_read_with_fds(
+        self: Pin<&mut Self>,
+        cx: &mut futures::task::Context,
+        buf: &mut [u8],
+        fds: &mut Vec<std::os::fd::OwnedFd>,
+    ) -> futures::task::Poll<Result<usize, futures::io::Error>> {
+        self.read(cx, buf, Some(fds))
+    }
+}
+
+impl Sender {
+    /// Writes a prefix of `buf`; when it writes anything, `fds` (copies of them) go with it.
+    fn write(
+        &self,
+        cx: &mut futures::task::Context,
         buf: &[u8],
+        #[cfg(unix)] fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> futures::task::Poll<Result<usize, futures::io::Error>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.read_end_closed {
@@ -124,11 +178,54 @@ impl AsyncWrite for Sender {
         let copy_len = std::cmp::min(buf.len(), inner.buffer.len() - inner.write_cursor);
         let dest_range = inner.write_cursor..inner.write_cursor + copy_len;
         inner.buffer[dest_range].copy_from_slice(&buf[0..copy_len]);
+        #[cfg(unix)]
+        if !fds.is_empty() && copy_len > 0 {
+            let owned = fds
+                .iter()
+                .map(|fd| fd.try_clone_to_owned())
+                .collect::<Result<Vec<_>, _>>()?;
+            let start = inner.write_cursor;
+            inner.fds.push_back((start, start + copy_len, owned));
+        }
         inner.write_cursor += copy_len;
         if let Some(read_waker) = inner.read_waker.take() {
             read_waker.wake();
         }
         Poll::Ready(Ok(copy_len))
+    }
+}
+
+#[cfg(unix)]
+impl capnp_futures::fd::AsyncFdWrite for Sender {
+    fn poll_write_with_fds(
+        self: Pin<&mut Self>,
+        cx: &mut futures::task::Context,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> futures::task::Poll<Result<usize, futures::io::Error>> {
+        self.write(cx, buf, fds)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut futures::task::Context,
+    ) -> Poll<Result<(), futures::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Sender {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut futures::task::Context,
+        buf: &[u8],
+    ) -> futures::task::Poll<Result<usize, futures::io::Error>> {
+        self.write(
+            cx,
+            buf,
+            #[cfg(unix)]
+            &[],
+        )
     }
 
     fn poll_flush(

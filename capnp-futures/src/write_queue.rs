@@ -27,7 +27,7 @@ use capnp::Error;
 
 use crate::serialize::AsOutputSegments;
 
-enum Item<M>
+pub(crate) enum Item<M>
 where
     M: AsOutputSegments,
 {
@@ -67,14 +67,7 @@ where
     W: AsyncWrite + Unpin,
     M: AsOutputSegments,
 {
-    let (tx, mut rx) = futures_channel::mpsc::unbounded::<Item<M>>();
-
-    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
-
-    let sender = Sender {
-        sender: tx,
-        in_flight: in_flight.clone(),
-    };
+    let (sender, mut rx, in_flight) = Sender::new();
 
     let queue = async move {
         while let Some(item) = rx.next().await {
@@ -119,6 +112,21 @@ impl<M> Sender<M>
 where
     M: AsOutputSegments,
 {
+    /// A sender, the queue's end of it, and the count of messages in flight.
+    pub(crate) fn new() -> (
+        Self,
+        futures_channel::mpsc::UnboundedReceiver<Item<M>>,
+        std::sync::Arc<std::sync::atomic::AtomicI32>,
+    ) {
+        let (tx, rx) = futures_channel::mpsc::unbounded::<Item<M>>();
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let sender = Self {
+            sender: tx,
+            in_flight: in_flight.clone(),
+        };
+        (sender, rx, in_flight)
+    }
+
     /// Enqueues a message to be written. Returns the message once the write
     /// has completed. Dropping the returned future does *not* cancel the write.
     pub fn send(&mut self, message: M) -> impl Future<Output = Result<M, Error>> + Unpin {

@@ -23,6 +23,7 @@ members = [
     "capnp-futures/test",
     "capnp-rpc/examples/hello-world",
     "capnp-rpc/examples/calculator",
+    "capnp-rpc/examples/fd-passing",
     "capnp-rpc/examples/pubsub",
     "capnp-rpc/examples/shared-secret-capability",
     "capnp-rpc/examples/streaming",

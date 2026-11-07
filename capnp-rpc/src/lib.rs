@@ -113,6 +113,12 @@ use capnp::message;
 
 /// A message to be sent by a [`VatNetwork`].
 pub trait OutgoingMessage {
+    /// Attaches descriptors in the order used by `CapDescriptor.attachedFd`.
+    ///
+    /// Transports without FD passing discard them, as permitted by the RPC protocol.
+    #[cfg(unix)]
+    fn set_fds(&mut self, _fds: Vec<Rc<dyn std::os::fd::AsFd>>) {}
+
     /// Gets the message body, which the caller may fill in any way it wants.
     ///
     /// The standard RPC implementation initializes it as a Message as defined
@@ -143,6 +149,14 @@ pub trait OutgoingMessage {
 
 /// A message received from a [`VatNetwork`].
 pub trait IncomingMessage {
+    /// Takes an attached descriptor. Each index can be taken at most once.
+    ///
+    /// Missing and out-of-range indices mean that no descriptor was attached.
+    #[cfg(unix)]
+    fn take_fd(&self, _index: usize) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
+
     /// Gets the message body, to be interpreted by the caller.
     ///
     /// The standard RPC implementation interprets it as a Message as defined
@@ -392,6 +406,52 @@ where
     capnp::capability::FromClientHook::new(Box::new(local::Client::new(
         <C as capnp::capability::FromServer<S>>::from_server(s),
     )))
+}
+
+/// Creates a local capability with a file descriptor attached, as `new_client()` does without.
+///
+/// Over a connection that passes file descriptors (`twoparty::VatNetwork::new_with_fds()`), the
+/// descriptor goes along with the capability, and the receiver gets it from [`get_fd`]; over any
+/// other, the capability goes alone. `fd` is anything holding a descriptor: an `OwnedFd`, a
+/// `File`, a socket, or an `Rc` of one the server keeps too. It stays open while the capability,
+/// one of its clones, or a reference from [`get_fd`] is alive.
+#[cfg(unix)]
+pub fn new_client_with_fd<C, S, F>(s: S, fd: F) -> C
+where
+    C: capnp::capability::FromServer<S>,
+    F: std::os::fd::AsFd + 'static,
+{
+    capnp::capability::FromClientHook::new(Box::new(local::Client::new_with_fd(
+        <C as capnp::capability::FromServer<S>>::from_server(Rc::new(s)),
+        Rc::new(fd),
+    )))
+}
+
+/// The file descriptor attached to a capability, waiting for a promise to resolve if needed.
+///
+/// `None`: none was attached, or it came over a connection that doesn't pass them; the
+/// protocol allows that, so callers must handle it. The descriptor stays open while the returned
+/// reference is alive; `as_fd().try_clone_to_owned()` gives one of the caller's own.
+#[cfg(unix)]
+pub fn get_fd<C: capnp::capability::FromClientHook>(
+    client: &C,
+) -> Promise<Option<Rc<dyn std::os::fd::AsFd>>, Error> {
+    let mut hook = client.as_client_hook().add_ref();
+    Promise::from_future(async move {
+        loop {
+            if let Some(fd) = hook.get_fd() {
+                return Ok(Some(fd));
+            }
+            if let Some(resolved) = hook.get_resolved() {
+                hook = resolved;
+                continue;
+            }
+            match hook.when_more_resolved() {
+                Some(resolution) => hook = resolution.await?,
+                None => return Ok(None),
+            }
+        }
+    })
 }
 
 /// Creates a "broken" capability that returns the given error from every operation.
